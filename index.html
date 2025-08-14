@@ -1,0 +1,704 @@
+<!DOCTYPE html>
+<!--
+  File: micro-apps/text-tools/url-formatter-cleaner-with-titles-v2.html
+  Purpose: Extract only regular (non-image) HTTP/HTTPS links from large pasted text,
+           and (optionally) fetch page titles to emit Markdown links WITHOUT bullets
+           and WITHOUT any leading "Title:" prefixes.
+
+  Notes:
+    - Single-file Micro-App (no build step, no local assets).
+    - In-line comments explain each section in plain language.
+    - Title fetching is best-effort: many sites block cross-origin reads (CORS).
+      • We first try a normal fetch.
+      • If that fails and the "Use proxy" option is ON, we fall back to https://r.jina.ai/<URL>
+        which returns a readability-friendly text version that often contains the page title.
+      • We sanitize titles to strip "Title:" and leading headings/bullets.
+      • If everything fails, we fall back to the URL's hostname as the title.
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>URL Cleaner + Title Fetcher — Markdown Links (No Bullets)</title>
+  <style>
+    /* =============== Theme tokens (easy color tweaking) =============== */
+    :root{
+      --bg:#0f1115;           /* page background (dark) */
+      --panel:#161a23;        /* cards/panels */
+      --panel-2:#0d1118;      /* headers / subpanels */
+      --text:#e5e7eb;         /* main text */
+      --muted:#9aa3b2;        /* secondary text */
+      --accent:#5b9cff;       /* primary accent */
+      --accent-2:#2f6fe6;     /* accent hover */
+      --border:#222838;       /* subtle borders */
+      --good:#22c55e;         /* success green */
+      --warn:#f59e0b;         /* warning amber */
+      --bad:#ef4444;          /* danger red */
+      --radius-lg:16px;       /* big rounded corners */
+      --radius:12px;          /* normal rounded corners */
+      --pad:14px;             /* base padding */
+      --shadow:0 18px 50px rgba(0,0,0,.35);
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      --sans: Inter, ui-sans-serif, system-ui, Segoe UI, Roboto, Helvetica, Arial;
+    }
+    /* Optional light theme (toggle button) */
+    [data-theme="light"]{
+      --bg:#f6f7fb;
+      --panel:#ffffff;
+      --panel-2:#f2f5fb;
+      --text:#0f172a;
+      --muted:#5b6474;
+      --accent:#2563eb;
+      --accent-2:#1e40af;
+      --border:#e6e8ee;
+      --shadow:0 18px 50px rgba(0,0,0,.08);
+    }
+
+    /* =============== Page reset and layout shell =============== */
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{
+      margin:0; background:var(--bg); color:var(--text);
+      font-family:var(--sans); -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;
+    }
+
+    header{
+      position:sticky; top:0; z-index:10;
+      display:flex; align-items:center; gap:10px;
+      padding:var(--pad);
+      background:linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,0)) , var(--bg);
+      border-bottom:1px solid var(--border);
+      -webkit-backdrop-filter: blur(6px);
+      backdrop-filter: blur(6px);
+    }
+    .brand{
+      display:flex; align-items:center; gap:10px;
+      background:var(--panel); border:1px solid var(--border);
+      padding:8px 12px; border-radius:10px; box-shadow:var(--shadow); font-weight:700;
+    }
+    .brand svg{color:var(--accent)}
+    .btn{
+      appearance:none; border:1px solid var(--border);
+      background:var(--panel); color:var(--text);
+      border-radius:10px; padding:10px 12px; cursor:pointer;
+      transition: transform .12s ease, border-color .12s ease, background .12s ease;
+    }
+    .btn:hover{transform:translateY(-1px); border-color:var(--accent)}
+    .btn.primary{background:var(--accent); border-color:var(--accent); color:#fff}
+    .btn.primary:hover{background:var(--accent-2); border-color:var(--accent-2)}
+    .btn[disabled]{opacity:.6; cursor:not-allowed; transform:none}
+    .pill{
+      display:inline-flex; align-items:center; gap:6px; font-size:12px; color:var(--muted);
+      border:1px solid var(--border); background:var(--panel); padding:6px 10px; border-radius:999px;
+    }
+    .kbd{
+      font-family:var(--mono); font-size:12px; padding:2px 6px;
+      border:1px solid var(--border); border-bottom-width:3px; border-radius:6px; background:var(--panel-2);
+    }
+
+    main{
+      padding:var(--pad);
+      display:grid; gap:var(--pad);
+      grid-template-columns: 1fr 1fr; /* two columns: input | output */
+    }
+    @media (max-width: 1024px){ main{grid-template-columns:1fr} }
+
+    .card{
+      background:var(--panel); border:1px solid var(--border);
+      border-radius:var(--radius-lg); box-shadow:var(--shadow); overflow:hidden;
+      display:grid; grid-template-rows:auto 1fr auto;
+    }
+    .card-header{
+      background:var(--panel-2); border-bottom:1px solid var(--border);
+      padding:var(--pad); display:flex; align-items:center; justify-content:space-between; gap:10px;
+    }
+    .card-body{ padding:var(--pad); overflow:auto }
+    .card-footer{ padding:var(--pad); border-top:1px solid var(--border); background:var(--panel-2); display:flex; gap:8px; flex-wrap:wrap }
+
+    h1,h2,h3{margin:0}
+    .muted{color:var(--muted)}
+    .row{display:flex; gap:8px; align-items:center}
+    .spacer{flex:1}
+  .hidden{display:none}
+
+    textarea{
+      width:100%; min-height:320px; resize:vertical;
+      border-radius:12px; border:1px solid var(--border);
+      background:var(--panel-2); color:var(--text); padding:12px;
+      font-family:var(--mono); font-size:14px; line-height:1.45;
+    }
+    .stats{ display:flex; gap:12px; flex-wrap:wrap; font-size:13px; color:var(--muted) }
+    .stats b{color:var(--text)}
+    .options{ display:flex; gap:14px; flex-wrap:wrap; align-items:center; font-size:14px; color:var(--muted) }
+    label.switch{
+      display:inline-flex; gap:8px; align-items:center; cursor:pointer;
+      background:var(--panel-2); padding:6px 10px; border:1px solid var(--border); border-radius:10px;
+    }
+    input[type="checkbox"]{ accent-color: var(--accent) }
+
+    /* Small toast notification (copy / status messages) */
+    .toast{
+      position:fixed; bottom:16px; right:16px; z-index:50;
+      background:var(--panel); border:1px solid var(--border); border-left:6px solid var(--good);
+      padding:10px 12px; border-radius:10px; box-shadow:var(--shadow);
+      opacity:0; transform:translateY(8px); transition:opacity .18s ease, transform .18s ease;
+      max-width: 60ch; white-space: pre-wrap;
+    }
+    .toast.show{opacity:1; transform:translateY(0)}
+    .spinner{ inline-size:14px; block-size:14px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin 1s linear infinite }
+    @keyframes spin{ to{ transform:rotate(360deg) } }
+  </style>
+</head>
+<body>
+  <!-- ========= Top bar with title and quick actions ========= -->
+  <header>
+    <div class="brand" role="img" aria-label="URL Cleaner">
+      <!-- tiny logo dot -->
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <circle cx="12" cy="12" r="8" fill="currentColor"></circle>
+      </svg>
+      URL Cleaner
+    </div>
+    <span class="pill">Paste → Clean URLs → Markdown with titles (no bullets)</span>
+    <div class="spacer"></div>
+    <button id="themeToggle" class="btn" title="Toggle theme (dark/light)">Toggle Theme</button>
+  </header>
+
+  <!-- ========= Main two-panel layout: Input | Output ========= -->
+  <main id="app" data-theme="dark">
+    <!-- ========== Left: Input panel ========== -->
+    <section class="card">
+      <div class="card-header">
+        <h3>Input Text</h3>
+        <div class="row">
+          <button id="btnPaste" class="btn" title="Paste from clipboard">Paste</button>
+          <span class="pill"><span class="kbd">Ctrl</span>/<span class="kbd">Cmd</span> + <span class="kbd">Enter</span> clean · <span class="kbd">Shift</span> + <span class="kbd">Enter</span> titles</span>
+        </div>
+      </div>
+      <div class="card-body">
+        <!-- Where you paste long/messy text with URLs -->
+        <textarea id="inputArea" placeholder="Paste any text here (descriptions, HTML/Markdown, etc.)"></textarea>
+      </div>
+      <div class="card-footer">
+        <!-- Simple options that tweak cleaning behavior -->
+        <div class="options">
+          <label class="switch" title="Remove UTM/fbclid/tracking params from kept links">
+            <input type="checkbox" id="optStripTracking" checked />
+            <span>Strip tracking params</span>
+          </label>
+          <label class="switch" title="Remove exact-duplicate links (case-insensitive)">
+            <input type="checkbox" id="optDedupe" checked />
+            <span>De-duplicate</span>
+          </label>
+          <label class="switch" title="Only keep http/https (ignore other schemes)">
+            <input type="checkbox" id="optHttpOnly" checked />
+            <span>HTTP(S) only</span>
+          </label>
+          <label class="switch" title="Fallback to a CORS-friendly proxy when fetching titles (best compatibility)">
+            <input type="checkbox" id="optProxy" checked />
+            <span>Use proxy for titles</span>
+          </label>
+        </div>
+        <div class="spacer"></div>
+        <button id="btnClean" class="btn primary" title="Extract non-image links (Ctrl/Cmd+Enter)">Clean Links</button>
+      </div>
+    </section>
+
+    <!-- ========== Right: Output panel ========== -->
+    <section class="card">
+      <div class="card-header">
+        <h3>Output</h3>
+        <div class="row">
+          <span id="counts" class="pill" aria-live="polite">0 kept · 0 removed</span>
+          <span id="loading" class="pill hidden"><span class="spinner" aria-hidden="true"></span> <span id="loadingText">Fetching…</span></span>
+          <button id="btnTitles" class="btn" title="Fetch titles and output Markdown (no bullets)">Titles → Markdown</button>
+          <button id="btnAddSpacing" class="btn" title="Insert a blank line between each link in the output">Add spacing</button>
+          <button id="btnRemoveSpacing" class="btn" title="Remove extra blank lines between links">Remove spacing</button>
+          <button id="btnSortDomain" class="btn" title="Sort by domain (group similar domains)">Sort by domain</button>
+          <button id="btnCopy" class="btn" title="Copy all to clipboard">Copy All</button>
+          <button id="btnDownload" class="btn" title="Download as .txt">Download</button>
+        </div>
+      </div>
+      <div class="card-body">
+        <!-- Read-only output (either URLs or Markdown list) -->
+  <textarea id="outputArea" placeholder="Your cleaned list (or Markdown) will appear here"></textarea>
+      </div>
+      <div class="card-footer">
+        <div class="stats" id="stats">
+          <div><b>Found:</b> <span id="statFound">0</span> links</div>
+          <div><b>Removed images:</b> <span id="statImg">0</span></div>
+          <div><b>Removed dupes:</b> <span id="statDupes">0</span></div>
+          <div><b>Kept:</b> <span id="statKept">0</span></div>
+          <div><b>Titles resolved:</b> <span id="statTitles">0</span></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Small toast element for feedback (copy / errors / summaries) -->
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <script>
+    // ===========================
+    // Helper shortcuts (tiny DOM utilities)
+    // ===========================
+    const qs  = (s, el=document) => el.querySelector(s);         // select one element by CSS selector
+    const qsa = (s, el=document) => [...el.querySelectorAll(s)]; // select many elements
+    const on  = (el, ev, fn, opts) => el.addEventListener(ev, fn, opts); // attach event listener
+
+    // ===========================
+    // URL detection and cleaning utilities
+    // ===========================
+
+    // Find raw http/https URLs in text (keeps anything until whitespace or obvious break)
+    // Layman's terms: look for "http://..." or "https://..." and grab characters until a space or quote.
+    const URL_REGEX = /https?:\/\/[^\s<>"'`)+\]}]+/gi;
+
+    // Direct image file extensions
+    const IMAGE_EXT = /\.(?:png|jpe?g|gif|bmp|webp|tiff?|svg|avif|heic|heif)$/i;
+
+    // Query params that hint an image format
+    const IMAGE_HINT_PARAMS = ['format','fm','image','img','ext'];
+
+    // Tracking params to strip when enabled
+    const TRACKING_PARAMS = [
+      'utm_source','utm_medium','utm_campaign','utm_term','utm_content',
+      'utm_name','utm_id','utm_creative_format','utm_creative_tactic',
+      'gclid','fbclid','mc_cid','mc_eid','igshid','msclkid','vero_conv','vero_id'
+    ];
+
+    // Trim trailing punctuation (like ")" or ",") and angle brackets around URLs
+    function trimTrailingPunctuation(url){
+      url = url.replace(/^<+|>+$/g, '');
+      const TRAIL = /[),.;:'"\]\}>]+$/;
+      while (TRAIL.test(url)) {
+        if (url.endsWith(')')) {
+          const open = (url.match(/\(/g)||[]).length;
+          const close = (url.match(/\)/g)||[]).length;
+          if (close <= open) break;
+        }
+        url = url.replace(TRAIL, '');
+      }
+      return url;
+    }
+
+    // Decide if a URL points directly to an image file
+    function isDirectImageURL(href){
+      if (/^(data|blob):/i.test(href)) return true;
+      let u; try { u = new URL(href); } catch { return false; }
+      if (!/^https?:$/i.test(u.protocol)) return false;
+      if (IMAGE_EXT.test(u.pathname)) return true;
+      for (const key of IMAGE_HINT_PARAMS) {
+        const val = (u.searchParams.get(key) || '').toLowerCase();
+        if (/(?:png|jpe?g|gif|bmp|webp|tiff?|svg|avif|heic|heif)/.test(val)) return true;
+      }
+      return false;
+    }
+
+    // Optionally remove common tracking parameters from a URL
+    function stripTrackingParams(href){
+      let u; try { u = new URL(href); } catch { return href; }
+      for (const p of TRACKING_PARAMS) u.searchParams.delete(p);
+      return u.toString().replace(/\?$/, '').replace(/#$/, '');
+    }
+
+    // ===========================
+    // Title parsing + normalization helpers
+    // ===========================
+
+    // Decode HTML entities like &amp; to &
+    function decodeEntities(str){ const t=document.createElement('textarea'); t.innerHTML=str; return t.value; }
+
+    // Normalize a title: trim, collapse whitespace, remove common prefixes like "Title: " or leading hashes/bullets
+    function normalizeTitle(s){
+      if (!s) return '';
+      s = decodeEntities(String(s)).replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+      s = s.replace(/^(?:title\s*:\s*)/i, ''); // drop leading "Title: " (case-insensitive)
+      s = s.replace(/^[#>\-\s]+/, '');         // drop leading Markdown headings/bullets/arrows
+      s = s.slice(0, 160);                      // keep titles reasonably short
+      return s;
+    }
+
+    // Escape [] and backslashes in Markdown link text to avoid breaking syntax
+    function markdownEscapeText(s){
+      return String(s).replace(/[\\\[\]]/g, m => `\\${m}`);
+    }
+
+    // Basic regex escape
+    function rxEscape(s){ return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+    // Extract a site core name from hostname (drop subdomains/TLDs where possible)
+    function hostCore(hostname){
+      const h = (hostname || '').replace(/^www\.|^m\.|^amp\.|^news\./i, '');
+      const parts = h.split('.');
+      if (parts.length <= 2) return parts[0] || h;
+      // choose the longest label as a heuristic core
+      return parts.reduce((a,b)=> (b.length>a.length?b:a), parts[0]);
+    }
+
+    // Strip trailing/leading site/brand suffixes like " - The Verge" or "| NYTimes"
+    function stripSiteSuffix(title, hostname, siteName){
+      let out = String(title || '');
+      if (!out) return '';
+      const core = hostCore(hostname);
+      const candidates = [siteName, core, hostname && hostname.replace(/^www\./i,'')].filter(Boolean)
+        .map(s => normalizeTitle(String(s))
+          .replace(/\.(com|net|org|io|dev|app|news|co|uk|de|jp|fr|es|it|nl|ru|br|au)$/i, ''))
+        .filter(Boolean)
+        .map(rxEscape);
+      if (!candidates.length) return out;
+
+      const SEP = '\\s*(?:[-–—|:•»]\\s*)';
+      const suffixRe = new RegExp(`${SEP}(?:${candidates.join('|')})\\s*$`, 'i');
+      const prefixRe = new RegExp(`^(?:${candidates.join('|')})${SEP}`, 'i');
+
+      let prev;
+      do { prev = out; out = out.replace(suffixRe, '').replace(prefixRe, ''); } while (out !== prev);
+      return out.trim();
+    }
+
+    // Derive a human-ish title from the URL slug as a last resort
+    function slugTitleFromURL(href){
+      try{
+        const u = new URL(href);
+        const segs = u.pathname.split('/').filter(Boolean);
+        let cand = segs.length ? segs[segs.length-1] : '';
+        if (!cand && segs.length > 1) cand = segs[segs.length-2];
+        cand = cand.replace(/\.(html?|php|aspx?)$/i, '');
+        cand = decodeURIComponent(cand).replace(/[\-_+]+/g, ' ');
+        if (/^\d+$/.test(cand) || cand.length < 3) return hostCore(u.hostname);
+        return normalizeTitle(cand);
+      }catch{ return ''; }
+    }
+
+    // Pull a reasonable title from HTML markup using DOMParser with multiple sources
+    function parseTitleFromHTML(html, hostname){
+      if (!html) return '';
+      let doc;
+      try { doc = new DOMParser().parseFromString(html, 'text/html'); } catch { doc = null; }
+      if (!doc) return '';
+      const pick = (sel) => {
+        const el = doc.querySelector(sel);
+        return el ? normalizeTitle(el.getAttribute('content') || el.textContent || '') : '';
+      };
+      const siteName = pick('meta[property="og:site_name"], meta[name="og:site_name"]');
+      const cands = [
+        pick('meta[property="og:title"], meta[name="og:title"]'),
+        pick('meta[name="twitter:title"], meta[property="twitter:title"], meta[name="title"], meta[property="title"]'),
+        pick('h1, h1[itemprop="headline"], [data-test-id="post-title"]'),
+        normalizeTitle(doc.title || '')
+      ].filter(Boolean);
+      let best = cands.find(Boolean) || '';
+      best = stripSiteSuffix(best, hostname, siteName);
+      return normalizeTitle(best);
+    }
+
+    // Pull a decent title from a plaintext article (proxy output). Skip obvious boilerplate.
+    function parseTitleFromPlain(text){
+      if (!text) return '';
+      const bad = /cookie|consent|subscribe|sign\s*in|log\s*in|adblock|advert|privacy|terms|404|not\s*found|redirecting/i;
+      const first = (text.split(/\r?\n/)
+        .map(s=>s.trim())
+        .filter(Boolean)
+        .find(s => s.length >= 3 && s.length <= 180 && !bad.test(s)) || '');
+      return normalizeTitle(first);
+    }
+
+    // ===========================
+    // Core cleaning logic
+    // ===========================
+
+    function cleanLinksFromText(raw, opts){
+      if (!raw) return { kept: [], found: 0, removedImages: 0, removedDupes: 0 };
+      const matches = raw.match(URL_REGEX) || [];
+      const foundCount = matches.length;
+      let links = matches.map(m => trimTrailingPunctuation(m));
+      if (opts.httpOnly) links = links.filter(h => /^https?:\/\//i.test(h));
+
+      const kept = []; let removedImages = 0;
+      for (const href of links) { if (isDirectImageURL(href)) removedImages++; else kept.push(href); }
+
+      let cleaned = kept.map(h => opts.stripTracking ? stripTrackingParams(h) : h);
+
+      let removedDupes = 0;
+      if (opts.dedupe) {
+        const seen = new Set(); const uniq = [];
+        for (const h of cleaned) { const key = h.toLowerCase(); if (!seen.has(key)) { seen.add(key); uniq.push(h); } else { removedDupes++; } }
+        cleaned = uniq;
+      }
+
+      return { kept: cleaned, found: foundCount, removedImages, removedDupes };
+    }
+
+    // ===========================
+    // Title fetching with concurrency + proxy fallback
+    // ===========================
+
+    // Promise with timeout so one slow site doesn't block everything
+    function withTimeout(promise, ms){
+      return Promise.race([ promise, new Promise((_, rej)=> setTimeout(()=> rej(new Error('timeout')), ms)) ]);
+    }
+
+    // Try to fetch a page's title. Strategy: direct fetch → proxy → fallback to hostname
+    // Simple in-session title cache
+    const titleCache = new Map();
+    (function hydrateCache(){
+      try{ const raw = sessionStorage.getItem('titleCacheV1'); if (raw) {
+        const obj = JSON.parse(raw); for (const [k,v] of Object.entries(obj)) titleCache.set(k, v);
+      }}catch{}
+    })();
+    function cacheGet(key){ return titleCache.get(key); }
+    function cacheSet(key, value){ try{ titleCache.set(key, value); sessionStorage.setItem('titleCacheV1', JSON.stringify(Object.fromEntries(titleCache))); }catch{} }
+
+    async function fetchTitleForURL(url, { useProxy=true, timeoutMs=10000 }={}){
+      const u = new URL(url);
+      const fallbackHost = u.hostname.replace(/^www\./, '');
+
+      const cached = cacheGet(url);
+      if (cached) return { url, title: cached, source: 'cache' };
+
+      try {
+        const res = await withTimeout(fetch(url, { mode:'cors', redirect:'follow', credentials:'omit' }), timeoutMs);
+        if (res && res.ok) {
+          const ct = res.headers.get('content-type') || '';
+          if (/text\/html|application\/(xhtml\+xml|html)/i.test(ct) || !ct) {
+            const html = await res.text();
+            const t = parseTitleFromHTML(html, u.hostname);
+            if (t) { cacheSet(url, t); return { url, title: t, source: 'direct' }; }
+          }
+        }
+      } catch (_) { /* swallow and try proxy */ }
+
+      if (useProxy) {
+        try {
+          const res2 = await withTimeout(fetch('https://r.jina.ai/' + url, { redirect:'follow' }), timeoutMs);
+          if (res2 && res2.ok) {
+            const text = await res2.text();
+            // r.jina.ai returns plain text; first try plain heuristics, then attempt HTML parse in case markup survived
+            let maybe = parseTitleFromPlain(text);
+            if (!maybe) maybe = parseTitleFromHTML(text, u.hostname);
+            if (!maybe) maybe = slugTitleFromURL(url) || fallbackHost;
+            if (maybe) { cacheSet(url, maybe); return { url, title: maybe, source: 'proxy' }; }
+          }
+        } catch (_) { /* ignore */ }
+      }
+
+      const last = slugTitleFromURL(url) || fallbackHost;
+      cacheSet(url, last);
+      return { url, title: last, source: 'fallback' };
+    }
+
+    // Map with limited concurrency
+    async function mapWithConcurrency(items, limit, mapper){
+      const results = new Array(items.length); let i = 0, active = 0;
+      return await new Promise((resolve)=>{
+        function launch(){
+          while (active < limit && i < items.length){
+            const idx = i++; active++;
+            Promise.resolve(mapper(items[idx], idx))
+              .then(v => { results[idx] = { status:'fulfilled', value:v }; })
+              .catch(e => { results[idx] = { status:'rejected', reason:e }; })
+              .finally(()=>{ active--; if (i < items.length) launch(); else if (active === 0) resolve(results); });
+          }
+        }
+        launch();
+      });
+    }
+
+    // ===========================
+    // UI wiring
+    // ===========================
+    const app = qs('#app');
+    const inputArea  = qs('#inputArea');
+    const outputArea = qs('#outputArea');
+    const btnClean   = qs('#btnClean');
+    const btnTitles  = qs('#btnTitles');
+    const btnCopy    = qs('#btnCopy');
+    const btnDownload= qs('#btnDownload');
+    const btnPaste   = qs('#btnPaste');
+  const btnAddSpacing = qs('#btnAddSpacing');
+  const btnRemoveSpacing = qs('#btnRemoveSpacing');
+  const btnSortDomain = qs('#btnSortDomain');
+    const themeToggle= qs('#themeToggle');
+
+    const optStrip   = qs('#optStripTracking');
+    const optDedupe  = qs('#optDedupe');
+    const optHttp    = qs('#optHttpOnly');
+    const optProxy   = qs('#optProxy');
+
+    const counts     = qs('#counts');
+    const statFound  = qs('#statFound');
+    const statImg    = qs('#statImg');
+    const statDupes  = qs('#statDupes');
+    const statKept   = qs('#statKept');
+    const statTitles = qs('#statTitles');
+    const toastEl    = qs('#toast');
+    const loadingEl  = qs('#loading');
+    const loadingTxt = qs('#loadingText');
+
+    let currentKept = [];
+
+    function showToast(msg='Copied!'){
+      toastEl.textContent = msg; toastEl.classList.add('show'); setTimeout(()=> toastEl.classList.remove('show'), 1600);
+    }
+
+    on(themeToggle, 'click', () => {
+      const next = app.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      app.setAttribute('data-theme', next);
+    });
+
+    on(btnPaste, 'click', async () => {
+      try { const txt = await navigator.clipboard.readText(); inputArea.value = txt || inputArea.value; inputArea.focus(); }
+      catch { showToast('Clipboard read blocked by browser'); }
+    });
+
+    on(btnClean, 'click', () => runClean());
+
+    // Keyboard shortcuts: Ctrl/Cmd + Enter to clean; +Shift to fetch titles → Markdown (no bullets)
+    on(document, 'keydown', (e) => {
+      const meta = e.ctrlKey || e.metaKey;
+      if (meta && e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); runClean(); }
+      if (meta && e.key === 'Enter' && e.shiftKey) { e.preventDefault(); runTitlesToMarkdown(); }
+    });
+
+    on(btnCopy, 'click', async () => {
+      const txt = outputArea.value || '';
+      try { await navigator.clipboard.writeText(txt); showToast('Output copied!'); }
+      catch { outputArea.focus(); outputArea.select(); showToast('Press Ctrl+C to copy'); }
+    });
+
+    on(btnDownload, 'click', () => {
+      const blob = new Blob([outputArea.value || ''], {type:'text/plain'});
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement('a'); a.href = url; a.download = 'links-or-markdown.txt'; a.click();
+      URL.revokeObjectURL(url);
+    });
+
+    on(btnTitles, 'click', () => runTitlesToMarkdown());
+
+    // Insert exactly one empty line between each non-empty line in the output
+    on(btnAddSpacing, 'click', () => {
+      const text = outputArea.value || '';
+      if (!text.trim()) { showToast('No output to space'); return; }
+      const lines = text.split(/\r?\n/).filter(l => l.trim() !== '');
+      if (!lines.length) { showToast('No output to space'); return; }
+      outputArea.value = lines.join('\n\n');
+      showToast('Added blank lines between links');
+    });
+
+    // Remove excess blank lines (compact to one line per link)
+    on(btnRemoveSpacing, 'click', () => {
+      const text = outputArea.value || '';
+      if (!text.trim()) { showToast('No output to trim'); return; }
+      const lines = text.split(/\r?\n/).filter(l => l.trim() !== '');
+      if (!lines.length) { showToast('No output to trim'); return; }
+      outputArea.value = lines.join('\n');
+      showToast('Removed extra blank lines');
+    });
+
+    // Sort output lines by domain name (hostname), grouping similar domains
+    on(btnSortDomain, 'click', () => {
+      const text = outputArea.value || '';
+      if (!text.trim()) { showToast('No output to sort'); return; }
+      const lines = text.split(/\r?\n/).filter(l => l.trim() !== '');
+      if (!lines.length) { showToast('No output to sort'); return; }
+
+      const URL_IN_LINE = /https?:\/\/[^\s<>"'`)+\]}]+/i;
+      function extractUrl(line){
+        const md = line.match(/\[[^\]]*\]\((https?:[^\s)]+)\)/i);
+        if (md) return md[1];
+        const m = line.match(URL_IN_LINE);
+        return m ? m[0] : '';
+      }
+      function hostKeyFromUrl(u){
+        try { const { hostname } = new URL(u); return (hostname || '').replace(/^www\./i,'').toLowerCase(); } catch { return ''; }
+      }
+
+      const enriched = lines.map((line, idx) => {
+        const url = extractUrl(line);
+        const hostKey = hostKeyFromUrl(url);
+        return { line, idx, hostKey };
+      });
+
+      enriched.sort((a,b) => {
+        if (a.hostKey && b.hostKey){
+          const c = a.hostKey.localeCompare(b.hostKey);
+          if (c !== 0) return c;
+          return a.line.localeCompare(b.line);
+        }
+        if (a.hostKey && !b.hostKey) return -1;
+        if (!a.hostKey && b.hostKey) return 1;
+        return a.line.localeCompare(b.line);
+      });
+
+      outputArea.value = enriched.map(e => e.line).join('\n');
+      showToast('Sorted by domain');
+    });
+
+    function setLoading(isOn, text){
+      loadingEl.classList.toggle('hidden', !isOn);
+      loadingTxt.textContent = text || 'Fetching…';
+  btnTitles.disabled = !!isOn; btnClean.disabled = !!isOn; btnCopy.disabled = !!isOn; btnDownload.disabled = !!isOn; btnAddSpacing.disabled = !!isOn; btnSortDomain.disabled = !!isOn;
+  btnRemoveSpacing.disabled = !!isOn;
+    }
+
+    // Clean → update UI state
+    function runClean(){
+      const opts = { stripTracking: !!optStrip.checked, dedupe: !!optDedupe.checked, httpOnly: !!optHttp.checked };
+      const res = cleanLinksFromText(inputArea.value || '', opts);
+      currentKept = res.kept.slice();
+      outputArea.value = res.kept.join('\n');
+      statFound.textContent = String(res.found);
+      statImg.textContent   = String(res.removedImages);
+      statDupes.textContent = String(res.removedDupes);
+      statKept.textContent  = String(res.kept.length);
+      statTitles.textContent= '0';
+      counts.textContent    = `${res.kept.length} kept · ${res.removedImages + res.removedDupes} removed`;
+    }
+
+    // Fetch titles for the current list, then print Markdown lines: [Title](URL)  (no bullets)
+    async function runTitlesToMarkdown(){
+      if (!currentKept.length) runClean();
+      const urls = currentKept.slice();
+      if (!urls.length){ showToast('Nothing to process — paste text and Clean first'); return; }
+
+      setLoading(true, `Fetching titles (0/${urls.length})`);
+      statTitles.textContent = '0';
+
+      const CONCURRENCY = 6; // a small pool keeps things fast without overloading
+      let resolved = 0, titleHits = 0;
+
+      const results = await mapWithConcurrency(urls, CONCURRENCY, async (u) => {
+        const r = await fetchTitleForURL(u, { useProxy: !!optProxy.checked, timeoutMs: 10000 });
+        resolved++; if (r && r.title) titleHits++;
+        if (resolved % 1 === 0) setLoading(true, `Fetching titles (${resolved}/${urls.length})`);
+        return r;
+      });
+
+      // Build Markdown lines without bullets
+      const lines = results.map((r, i) => {
+        let url = urls[i];
+        let title = '';
+        if (r && r.status === 'fulfilled' && r.value) {
+          url = r.value.url || url;
+          title = r.value.title || '';
+        }
+        let safeTitle = normalizeTitle(title);
+        if (!safeTitle) safeTitle = slugTitleFromURL(url) || new URL(url).hostname.replace(/^www\./, '');
+        return `[${markdownEscapeText(safeTitle)}](${url})`;
+      });
+
+      outputArea.value = lines.join('\n');
+      statTitles.textContent = String(titleHits);
+      counts.textContent = `${urls.length} links → Markdown (no bullets, titles resolved: ${titleHits})`;
+      setLoading(false);
+
+      const proxyNote = optProxy.checked ? '\n(Proxy ON for better compatibility)' : '';
+      showToast(`Markdown ready for ${urls.length} link(s). Titles resolved: ${titleHits}${proxyNote}`);
+    }
+
+    // Auto-run if input already has content (e.g., after refresh)
+    if ((qs('#inputArea').value||'').trim()) runClean();
+  </script>
+</body>
+</html>
